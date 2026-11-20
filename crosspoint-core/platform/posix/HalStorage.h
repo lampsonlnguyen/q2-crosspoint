@@ -46,6 +46,7 @@ class HalFile {
   size_t write(const uint8_t* data, size_t count) {
     return fp_ ? std::fwrite(data, 1, count, fp_) : 0;
   }
+  int read() { return fp_ ? std::fgetc(fp_) : -1; }
   int read(void* dst, size_t count) {
     if (!fp_ || (!dst && count)) return -1;
     const size_t n = std::fread(dst, 1, count, fp_);

@@ -16,6 +16,7 @@ class HalDisplay {
   enum class GrayscaleBase { White, Black };
   enum class GrayscaleEncoding { Differential, Absolute };
   struct GrayscaleCapabilities {
+    bool asyncBase=false;
     bool stripUploads=false;
     bool retainedOverlay=false;
     bool baseFrame=false;
@@ -45,6 +46,7 @@ class HalDisplay {
   void copyGrayscaleMsbBuffers(const uint8_t*) {}
   void cleanupGrayscaleBuffers(const uint8_t*) {}
   void displayGrayBuffer(bool=false) {}
+  bool displayRetainedGrayscaleOverlay(uint16_t,uint16_t,uint16_t,uint16_t,bool) {return false;}
   void writeGrayscalePlaneStrip(bool,const uint8_t*,uint16_t,uint16_t) {}
   GrayscaleCapabilities grayscaleCapabilities(GrayscaleMode=GrayscaleMode::Overlay) const {return {};}
   uint16_t getDisplayWidth() const {return DISPLAY_WIDTH;}

@@ -252,3 +252,62 @@ add_executable(crosspoint_q2_hal_display_tests tests/q2_hal_display_test.cpp)
 target_link_libraries(crosspoint_q2_hal_display_tests PRIVATE crosspoint_q2_hal_display)
 target_compile_options(crosspoint_q2_hal_display_tests PRIVATE -UNDEBUG)
 add_test(NAME crosspoint_q2_monochrome_hal COMMAND crosspoint_q2_hal_display_tests)
+
+# Compile original upstream renderer as an object library. This is a
+# compile-only integration gate: linking a real reader requires all font,
+# image and FreeInk-independent Q2 adapters.
+add_library(crosspoint_renderer_objects OBJECT
+    lib/GfxRenderer/GfxRenderer.cpp
+    lib/GfxRenderer/Bitmap.cpp
+    lib/GfxRenderer/FontCacheManager.cpp
+    lib/Memory/BuildScratch.cpp
+    lib/EpdFont/FontDecompressor.cpp
+    lib/EpdFont/ComplexShaper.cpp
+    lib/EpdFont/SdCardFont.cpp
+    lib/Utf8/IndicReorder.cpp
+    lib/OtShaper/OtShaper.cpp
+    lib/OtShaper/OtIndic.cpp
+    lib/OtShaper/OtNormalize.cpp
+    lib/OtShaper/OtUse.cpp
+    lib/OtShaper/OtFace.cpp
+    lib/OtShaper/OtLayout.cpp
+    lib/OtShaper/OtPlan.cpp
+    lib/OtShaper/OtBuffer.cpp
+    lib/OtShaper/OtGpos.cpp
+    lib/OtShaper/OtGsub.cpp
+    platform/posix/FontAlloc.c
+)
+target_compile_definitions(crosspoint_renderer_objects PRIVATE CROSSPOD_LINUX=1)
+set_target_properties(crosspoint_renderer_objects PROPERTIES
+    CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+target_include_directories(crosspoint_renderer_objects PRIVATE
+    lib/EpdFont/scripts
+    lib/OtShaper
+    lib
+    lib/Epub
+    lib/Epub/css
+    lib/EpdFont
+    lib/GfxRenderer
+    lib/Utf8
+    lib/MiniBidi
+    lib/Serialization
+    lib/Memory
+    lib/XmlParserUtils
+    platform/posix
+    platform/q2
+)
+
+# Link gate: force every reference from the original GfxRenderer object through
+# the linker. Compile-only success is not enough to establish a working engine.
+add_executable(crosspoint_renderer_link_tests
+    tests/renderer_link_test.cpp
+    $<TARGET_OBJECTS:crosspoint_renderer_objects>)
+target_include_directories(crosspoint_renderer_link_tests PRIVATE
+    lib lib/Epub lib/EpdFont lib/GfxRenderer lib/Utf8 lib/MiniBidi
+    lib/Memory platform/posix)
+target_link_libraries(crosspoint_renderer_link_tests PRIVATE
+    crosspoint_q2_hal_display crosspoint_font_metrics crosspoint_bidi
+    crosspoint_utf8 crosspoint_layout_foundation ZLIB::ZLIB)
+set_target_properties(crosspoint_renderer_link_tests PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+target_compile_options(crosspoint_renderer_link_tests PRIVATE -UNDEBUG)
+add_test(NAME crosspoint_renderer_real_link COMMAND crosspoint_renderer_link_tests)
