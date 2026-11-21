@@ -2,7 +2,7 @@ name: CrossPoint Core CI
 
 on:
   push:
-    branches: [main, crosspod-renderer-linux-link, crosspod-original-chapter-engine]
+    branches: [main, crosspod-renderer-linux-link, crosspod-original-chapter-engine, crosspod-reading-experience]
   pull_request:
     branches: [main]
   workflow_dispatch:

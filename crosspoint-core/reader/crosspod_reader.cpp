@@ -24,6 +24,8 @@
 #include "Typography.hpp"
 #include "ScriptFonts.hpp"
 #include "ReadingPosition.hpp"
+#include "ReaderPreferences.hpp"
+#include "Bookmarks.hpp"
 #include "PngPreview.hpp"
 #include "JpegPreview.hpp"
 #include <Q2SocketInput.hpp>
@@ -45,6 +47,7 @@
 #include <utility>
 #include <vector>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <dirent.h>
 #include <cctype>
 #include <unistd.h>
@@ -57,6 +60,7 @@ constexpr size_t MAX_PAGES_PER_SPINE = 512;
 constexpr int SCREEN_H = 320, LEFT = 14, TOP = 16;
 constexpr int TEXT_WIDTH = 345, BOTTOM = 306;
 volatile std::sig_atomic_t interrupted = 0;
+std::string clippedLabel(const std::string&,size_t);
 void exitOnSignal(int) { interrupted = 1; }
 
 std::string_view localName(std::string_view tag) {
@@ -463,12 +467,27 @@ class Reader {
   std::unique_ptr<Section> upstreamSection_;
   int upstreamFontId_=0;
   crosspod::Typography typography_{};
+  crosspod::ReaderPreferences preferences_{};
   std::string typographyNotice_;
   std::vector<RenderPage> pages_;
+  // A bounded 3-page 1-bpp raster cache (~45 KB) avoids repeated SD-page
+  // decompression, layout painting and glyph lookups when moving back/forward.
+  struct CachedRaster {
+    int spine=-1;
+    size_t page=0;
+    std::vector<uint8_t> pixels;
+  };
+  std::array<CachedRaster,3> rasterCache_{};
+  size_t nextRasterSlot_=0;
+  void clearRasterCache() {
+    for(auto& item:rasterCache_)item.spine=-1;
+  }
   int currentSpine_ = -1;
   size_t currentPage_ = 0;
   bool resumeEnabled_ = false;
-  int lineHeight() const { return std::max(27,typography_.size*2); }
+  mutable bool positionDirty_=false;
+  mutable std::chrono::steady_clock::time_point lastPositionSync_{};
+  int lineHeight() const { return std::max(22,typography_.size*2); }
   size_t pageCount() const {
     return upstreamSection_?upstreamSection_->pageCount:pages_.size();
   }
@@ -479,8 +498,12 @@ class Reader {
   ReaderRenderSpec upstreamSpec() const {
     ReaderRenderSpec spec;
     spec.fontId=upstreamFontId_;
-    spec.viewportWidth=TEXT_WIDTH;
+    spec.viewportWidth=static_cast<uint16_t>(375-2*preferences_.margin-2);
     spec.viewportHeight=BOTTOM-TOP;
+    spec.lineCompression=preferences_.linePercent/100.0f;
+    spec.paragraphAlignment=static_cast<uint8_t>(preferences_.alignment);
+    spec.hyphenationEnabled=preferences_.hyphenation;
+    spec.embeddedStyle=preferences_.embeddedStyle;
     spec.lineCompression=1.0f;
     spec.embeddedStyle=true;
     spec.imageRendering=0;
@@ -539,7 +562,7 @@ class Reader {
     renderer_.removeFont(1);
     if(upstreamFontId_)renderer_.removeFont(upstreamFontId_);
     const int nextFontId=fontIdForTypography(settings);
-    if(next) {
+    if(next && next->getEpdFont()) {
       renderer_.insertFont(1,EpdFontFamily(settings.size,next->getEpdFont()));
       renderer_.registerSdCardFont(1,next.get());
       renderer_.insertFont(nextFontId,EpdFontFamily(settings.size,next->getEpdFont()));
@@ -552,6 +575,7 @@ class Reader {
     upstreamFontId_=nextFontId;
     scriptFonts_.load(renderer_,settings.size,{1,nextFontId});
     typography_=settings;
+    clearRasterCache();
     return true;
   }
 
@@ -666,8 +690,12 @@ class Reader {
       metadata_(temporary_.path()),renderer_(display_),
       bodyFont_(&notosans_12_regular),
       fontCache_(renderer_.getFontMap(),renderer_.getSdCardFonts(),renderer_.getTtfFonts()) {}
-  ~Reader() { ImageBlock::setExtractor(nullptr,nullptr); }
+  ~Reader() {
+    flushPosition();
+    ImageBlock::setExtractor(nullptr,nullptr);
+  }
   bool open() {
+    (void)crosspod::loadReaderPreferences(preferences_);
     if (temporary_.path().empty()) {
       std::fputs("CrossPod: cannot create temporary cache\n",stderr);return false;
     }
@@ -709,6 +737,8 @@ class Reader {
     renderer_.setOrientation(GfxRenderer::LandscapeCounterClockwise);
     renderer_.begin();
     renderer_.insertFont(1,EpdFontFamily(12,&bodyFont_));
+    // UI font is always fixed; book typography updates must not touch it.
+    renderer_.insertFont(2,EpdFontFamily(12,&bodyFont_));
     if (!decompressor_.init()) return false;
     fontCache_.setFontDecompressor(&decompressor_);
     renderer_.setFontCacheManager(&fontCache_);
@@ -743,10 +773,22 @@ class Reader {
       return;
     }
     currentPage_=std::min(saved.page,pageCount()-1);
+    positionDirty_=false;
+    lastPositionSync_=std::chrono::steady_clock::now();
   }
-  void persistPosition() const {
-    if(resumeEnabled_)
-      (void)crosspod::saveReadingPosition(bookPath_,{currentSpine_,currentPage_});
+  void persistPosition(bool force=false) const {
+    if(!resumeEnabled_ || currentSpine_<0)return;
+    positionDirty_=true;
+    const auto now=std::chrono::steady_clock::now();
+    if(!force && lastPositionSync_.time_since_epoch().count()!=0 &&
+       now-lastPositionSync_<std::chrono::seconds(5))return;
+    if(crosspod::saveReadingPosition(bookPath_,{currentSpine_,currentPage_})) {
+      lastPositionSync_=now;
+      positionDirty_=false;
+    }
+  }
+  void flushPosition(bool force=true) const {
+    if(positionDirty_)persistPosition(force);
   }
   bool configureTypography(crosspod::Typography requested) {
     if(!crosspod::validTypography(requested))return false;
@@ -754,6 +796,9 @@ class Reader {
     const auto previous=typography_;
     const int spine=currentSpine_;
     const size_t page=currentPage_;
+    const auto offset=upstreamSection_?
+      upstreamSection_->getVisibleTextOffsetForPage(
+        static_cast<uint16_t>(currentPage_)):std::nullopt;
     if(!useTypography(requested)) {
       typographyNotice_="Font file not installed";
       return false;
@@ -764,7 +809,16 @@ class Reader {
       typographyNotice_="Could not repaginate";
       return false;
     }
-    if(spine>=0 && pageCount())currentPage_=std::min(page,pageCount()-1);
+    if(spine>=0 && pageCount()) {
+      if(upstreamSection_ && offset) {
+        while(upstreamSection_->isBuilding() &&
+              !upstreamSection_->buildReachedVisibleTextOffset(*offset)) {
+          if(!upstreamSection_->buildSomeMore(2))break;
+        }
+        currentPage_=upstreamSection_->getPageForVisibleTextOffset(*offset)
+            .value_or(static_cast<uint16_t>(std::min(page,pageCount()-1)));
+      } else currentPage_=std::min(page,pageCount()-1);
+    }
     if(!crosspod::saveTypography(typography_))
       typographyNotice_="Settings not saved to SD";
     else typographyNotice_.clear();
@@ -772,22 +826,343 @@ class Reader {
     return true;
   }
   crosspod::Typography typography() const {return typography_;}
-  void showTypographyMenu(int selected) {
+  crosspod::ReaderPreferences preferences() const {return preferences_;}
+  size_t chapterCount() const {
+    if(upstreamEpub_ && upstreamEpub_->getTocItemsCount()>0)
+      return static_cast<size_t>(upstreamEpub_->getTocItemsCount());
+    return static_cast<size_t>(metadata_.getSpineCount());
+  }
+  int currentChapter() const {
+    if(upstreamEpub_ && upstreamEpub_->getTocItemsCount()>0 &&
+       upstreamSection_) {
+      const int item=upstreamSection_->getTocIndexForPage(
+        static_cast<int>(currentPage_));
+      if(item>=0 && item<upstreamEpub_->getTocItemsCount())return item;
+    }
+    return currentSpine_;
+  }
+  size_t currentPage() const {return currentPage_;}
+  std::string chapterName(size_t index) {
+    if(index>=chapterCount())return {};
+    if(upstreamEpub_ && upstreamEpub_->getTocItemsCount()>0)
+      return upstreamEpub_->getTocItem(static_cast<int>(index)).title;
+    const auto entry=metadata_.getSpineEntry(static_cast<int>(index));
+    std::string title=entry.href;
+    const size_t slash=title.find_last_of('/');
+    if(slash!=std::string::npos)title.erase(0,slash+1);
+    const size_t ext=title.find_last_of('.');
+    if(ext!=std::string::npos)title.resize(ext);
+    return title;
+  }
+  bool goToChapter(int chapter) {
+    if(chapter<0||static_cast<size_t>(chapter)>=chapterCount())return false;
+    if(upstreamEpub_ && upstreamEpub_->getTocItemsCount()>0) {
+      const auto item=upstreamEpub_->getTocItem(chapter);
+      if(item.spineIndex<0)return false;
+      if(!loadSpine(item.spineIndex,1))return false;
+      if(upstreamSection_ && !item.anchor.empty()) {
+        auto target=upstreamSection_->findAnchor(item.anchor);
+        while(!target && upstreamSection_->isBuilding()) {
+          if(!upstreamSection_->buildSomeMore(2))break;
+          target=upstreamSection_->findAnchor(item.anchor);
+        }
+        if(target && *target<pageCount())currentPage_=*target;
+      }
+    } else if(!loadSpine(chapter,1))return false;
+    persistPosition();return true;
+  }
+  void dumpToc() {
+    if(!upstreamEpub_)return;
+    const int count=upstreamEpub_->getTocItemsCount();
+    std::printf("CrossPod TOC entries: %d\n",count);
+    for(int i=0;i<count;++i) {
+      const auto t=upstreamEpub_->getTocItem(i);
+      std::printf("toc=%d spine=%d depth=%u title=%s anchor=%s\n",
+          i,t.spineIndex,t.level,t.title.c_str(),t.anchor.c_str());
+    }
+  }
+  bool rememberPage() {
+    const uint32_t offset=upstreamSection_?
+      upstreamSection_->getVisibleTextOffsetForPage(
+        static_cast<uint16_t>(currentPage_)).value_or(0):0;
+    const bool saved=crosspod::addBookmark(bookPath_,
+      {currentSpine_,currentPage_,offset});
+    typographyNotice_=saved?"Bookmark saved":"Cannot save bookmark";
+    return saved;
+  }
+  std::vector<crosspod::Bookmark> bookmarks() const {
+    return crosspod::loadBookmarks(bookPath_);
+  }
+  bool goToBookmark(const crosspod::Bookmark& mark) {
+    // Bookmark chapter numbers are OPF spine indices, not TOC entry ordinals.
+    if(mark.spine<0 || !loadSpine(mark.spine,1))return false;
+    if(upstreamSection_ && mark.textOffset) {
+      while(upstreamSection_->isBuilding() &&
+           !upstreamSection_->buildReachedVisibleTextOffset(mark.textOffset)) {
+        if(!upstreamSection_->buildSomeMore(2))break;
+      }
+      currentPage_=upstreamSection_->getPageForVisibleTextOffset(
+        mark.textOffset).value_or(static_cast<uint16_t>(
+          std::min(mark.page,pageCount()-1)));
+    } else currentPage_=std::min(mark.page,pageCount()-1);
+    persistPosition();
+    return true;
+  }
+  void showNavigationMenu(bool showingBookmarks,int selected) {
     render();
-    renderer_.fillRect(13,55,349,205,true);
-    renderer_.fillRect(15,57,345,201,false);
-    renderer_.drawText(1,30,74,"Reading appearance");
-    char row[96];
-    std::snprintf(row,sizeof(row),"%s Font: %s",
-      selected==0?">":" ",crosspod::typographyFamilyName(typography_.family));
-    renderer_.drawText(1,31,117,row);
-    std::snprintf(row,sizeof(row),"%s Size: %d",
-      selected==1?">":" ",typography_.size);
-    renderer_.drawText(1,31,152,row);
-    renderer_.drawText(1,31,190,"Wheel: select  Center: change");
-    renderer_.drawText(1,31,220,"Back: return to book");
-    if(!typographyNotice_.empty())
-      renderer_.drawText(1,31,245,typographyNotice_.c_str());
+    renderer_.fillRect(9,38,357,255,true);
+    renderer_.fillRect(11,40,353,251,false);
+    renderer_.drawText(1,23,48,showingBookmarks?"Bookmarks":"Chapters");
+    const auto marks=showingBookmarks?bookmarks():
+      std::vector<crosspod::Bookmark>{};
+    const size_t count=showingBookmarks?marks.size():chapterCount();
+    if(!count)renderer_.drawText(1,25,127,"No bookmarks yet");
+    const int start=selected<0?0:(selected/7)*7;
+    for(int row=0;row<7 && start+row<static_cast<int>(count);++row) {
+      const int item=start+row;
+      const int y=81+row*25;
+      const bool active=item==selected;
+      if(active)renderer_.fillRect(17,y-3,341,22,true);
+      std::string label;
+      if(showingBookmarks) {
+        const auto& mark=marks[item];
+        label="Ch "+std::to_string(mark.spine+1)+
+          " - Page "+std::to_string(mark.page+1);
+      } else label=std::to_string(item+1)+". "+chapterName(item);
+      label=clippedLabel(label,34);
+      renderer_.drawText(1,24,y,label.c_str(),!active);
+    }
+    renderer_.drawText(1,23,265,"Wheel: select  Center: go");
+    renderer_.drawText(1,23,286,"Back: reading settings");
+    display_.displayBuffer();
+  }
+
+  bool adjustPreference(int option) {
+    crosspod::ReaderPreferences next=preferences_;
+    switch(option) {
+      case 2: next.linePercent=next.linePercent==100?120:
+          (next.linePercent==120?140:100);break;
+      case 3: next.margin=next.margin==14?22:
+          (next.margin==22?30:14);break;
+      case 4: next.alignment=1-next.alignment;break;
+      case 5: next.hyphenation=!next.hyphenation;break;
+      case 6: next.embeddedStyle=!next.embeddedStyle;break;
+      case 7: next.nightMode=!next.nightMode;break;
+      default:return false;
+    }
+    if(!crosspod::validReaderPreferences(next))return false;
+    if(option==7) {
+      // Inversion is a framebuffer setting; no new Section layout and no
+      // SD cache invalidation are necessary.
+      preferences_=next;
+      clearRasterCache();
+      const bool saved=crosspod::saveReaderPreferences(preferences_);
+      typographyNotice_=saved?"":"Reading settings not saved";
+      return true;
+    }
+    const auto previous=preferences_;
+    const int spine=currentSpine_;
+    const size_t priorPage=currentPage_;
+    auto offset=upstreamSection_?
+      upstreamSection_->getVisibleTextOffsetForPage(
+        static_cast<uint16_t>(currentPage_)):std::nullopt;
+    preferences_=next;
+    clearRasterCache();
+    if(spine>=0 && (!loadSpine(spine,1)||currentSpine_!=spine)) {
+      preferences_=previous;
+      clearRasterCache();
+      (void)loadSpine(spine,1);
+      currentPage_=std::min(priorPage,pageCount()-1);
+      typographyNotice_="Could not update page layout";
+      return false;
+    }
+    // Preserve content position when a completed Section gives an exact
+    // visible-text offset; do not assume the old page number is stable after
+    // changing margins or line spacing.
+    if(upstreamSection_ && offset) {
+      while(upstreamSection_->isBuilding() &&
+            !upstreamSection_->buildReachedVisibleTextOffset(*offset)) {
+        if(!upstreamSection_->buildSomeMore(2))break;
+      }
+      auto nextPage=upstreamSection_->getPageForVisibleTextOffset(*offset);
+      currentPage_=nextPage.value_or(
+        static_cast<uint16_t>(std::min(priorPage,pageCount()-1)));
+    } else if(pageCount())currentPage_=std::min(priorPage,pageCount()-1);
+    if(!crosspod::saveReaderPreferences(preferences_))
+      typographyNotice_="Reading settings not saved";
+    else typographyNotice_.clear();
+    persistPosition();
+    return true;
+  }
+  // Built-in 12pt font ID 2 stays constant when the reader font changes.
+  // Scale it for compact menus without loading different SD-card glyph sizes.
+  // Crisp fixed 5x7 pixel glyphs; no bilinear resampling or SD font I/O.
+  // 2x integer scale makes 10x14 glyphs and fixed 12px character advance.
+  // This typography is isolated from the configurable EPUB reading font.
+  void drawMenuText(int x,int top,const char* str,int scale=2) {
+    static constexpr uint8_t glyphs[95][5]={
+    {0x00,0x00,0x00,0x00,0x00}, // 32
+    {0x00,0x00,0x5f,0x00,0x00}, // 33
+    {0x00,0x07,0x00,0x07,0x00}, // 34
+    {0x12,0x3f,0x12,0x3f,0x12}, // 35
+    {0x12,0x15,0x1f,0x05,0x08}, // 36
+    {0x13,0x0b,0x04,0x1a,0x19}, // 37
+    {0x36,0x49,0x55,0x2a,0x50}, // 38
+    {0x00,0x04,0x03,0x00,0x00}, // 39
+    {0x00,0x1c,0x22,0x41,0x00}, // 40
+    {0x00,0x41,0x22,0x1c,0x00}, // 41
+    {0x2a,0x1c,0x3e,0x1c,0x2a}, // 42
+    {0x08,0x08,0x3e,0x08,0x08}, // 43
+    {0x00,0x40,0x30,0x10,0x00}, // 44
+    {0x08,0x08,0x08,0x08,0x08}, // 45
+    {0x00,0x60,0x60,0x00,0x00}, // 46
+    {0x40,0x30,0x08,0x06,0x01}, // 47
+    {0x3e,0x51,0x4d,0x43,0x3e}, // 48
+    {0x00,0x42,0x7f,0x40,0x00}, // 49
+    {0x42,0x61,0x51,0x49,0x46}, // 50
+    {0x41,0x49,0x49,0x49,0x36}, // 51
+    {0x18,0x14,0x12,0x7f,0x10}, // 52
+    {0x4f,0x49,0x49,0x49,0x31}, // 53
+    {0x3e,0x49,0x49,0x49,0x30}, // 54
+    {0x01,0x71,0x09,0x05,0x03}, // 55
+    {0x36,0x49,0x49,0x49,0x36}, // 56
+    {0x06,0x49,0x49,0x49,0x3e}, // 57
+    {0x00,0x36,0x36,0x00,0x00}, // 58
+    {0x00,0x56,0x36,0x00,0x00}, // 59
+    {0x08,0x14,0x22,0x41,0x00}, // 60
+    {0x0a,0x0a,0x0a,0x0a,0x0a}, // 61
+    {0x00,0x41,0x22,0x14,0x08}, // 62
+    {0x02,0x01,0x51,0x09,0x06}, // 63
+    {0x3e,0x41,0x5d,0x55,0x5e}, // 64
+    {0x7e,0x09,0x09,0x09,0x7e}, // 65
+    {0x7f,0x49,0x49,0x49,0x36}, // 66
+    {0x3e,0x41,0x41,0x41,0x41}, // 67
+    {0x7f,0x41,0x41,0x41,0x3e}, // 68
+    {0x7f,0x49,0x49,0x49,0x41}, // 69
+    {0x7f,0x09,0x09,0x09,0x01}, // 70
+    {0x3e,0x41,0x49,0x49,0x79}, // 71
+    {0x7f,0x08,0x08,0x08,0x7f}, // 72
+    {0x00,0x41,0x7f,0x41,0x00}, // 73
+    {0x30,0x40,0x41,0x3f,0x01}, // 74
+    {0x7f,0x08,0x14,0x22,0x41}, // 75
+    {0x7f,0x40,0x40,0x40,0x40}, // 76
+    {0x7f,0x02,0x0c,0x02,0x7f}, // 77
+    {0x7f,0x02,0x04,0x08,0x7f}, // 78
+    {0x3e,0x41,0x41,0x41,0x3e}, // 79
+    {0x7f,0x09,0x09,0x09,0x06}, // 80
+    {0x3e,0x41,0x51,0x21,0x5e}, // 81
+    {0x7f,0x09,0x19,0x29,0x46}, // 82
+    {0x46,0x49,0x49,0x49,0x31}, // 83
+    {0x01,0x01,0x7f,0x01,0x01}, // 84
+    {0x3f,0x40,0x40,0x40,0x3f}, // 85
+    {0x1f,0x20,0x40,0x20,0x1f}, // 86
+    {0x3f,0x40,0x38,0x40,0x3f}, // 87
+    {0x63,0x14,0x08,0x14,0x63}, // 88
+    {0x03,0x04,0x78,0x04,0x03}, // 89
+    {0x61,0x51,0x49,0x45,0x43}, // 90
+    {0x00,0x7f,0x41,0x41,0x00}, // 91
+    {0x01,0x06,0x08,0x30,0x40}, // 92
+    {0x00,0x41,0x41,0x7f,0x00}, // 93
+    {0x04,0x02,0x01,0x02,0x04}, // 94
+    {0x40,0x40,0x40,0x40,0x40}, // 95
+    {0x00,0x01,0x02,0x04,0x00}, // 96
+    {0x20,0x54,0x54,0x54,0x78}, // 97
+    {0x7f,0x44,0x44,0x44,0x38}, // 98
+    {0x38,0x44,0x44,0x44,0x44}, // 99
+    {0x38,0x44,0x44,0x44,0x7f}, // 100
+    {0x38,0x54,0x54,0x54,0x58}, // 101
+    {0x08,0x7e,0x09,0x01,0x02}, // 102
+    {0x0c,0x52,0x52,0x52,0x3e}, // 103
+    {0x7f,0x04,0x04,0x04,0x78}, // 104
+    {0x00,0x44,0x7d,0x40,0x00}, // 105
+    {0x20,0x40,0x44,0x3d,0x00}, // 106
+    {0x7f,0x10,0x28,0x44,0x00}, // 107
+    {0x00,0x41,0x7f,0x40,0x00}, // 108
+    {0x7c,0x04,0x78,0x04,0x78}, // 109
+    {0x7c,0x04,0x04,0x04,0x78}, // 110
+    {0x38,0x44,0x44,0x44,0x38}, // 111
+    {0x7c,0x14,0x14,0x14,0x08}, // 112
+    {0x08,0x14,0x14,0x14,0x7c}, // 113
+    {0x7c,0x08,0x04,0x04,0x08}, // 114
+    {0x48,0x54,0x54,0x54,0x24}, // 115
+    {0x04,0x3f,0x44,0x40,0x20}, // 116
+    {0x3c,0x40,0x40,0x20,0x7c}, // 117
+    {0x1c,0x20,0x40,0x20,0x1c}, // 118
+    {0x3c,0x40,0x30,0x40,0x3c}, // 119
+    {0x44,0x28,0x10,0x28,0x44}, // 120
+    {0x0c,0x50,0x50,0x50,0x3c}, // 121
+    {0x44,0x64,0x54,0x4c,0x44}, // 122
+    {0x00,0x08,0x36,0x41,0x00}, // 123
+    {0x00,0x00,0x7f,0x00,0x00}, // 124
+    {0x00,0x41,0x36,0x08,0x00}, // 125
+    {0x04,0x02,0x04,0x04,0x02}, // 126
+    };
+    for(const unsigned char* p=
+          reinterpret_cast<const unsigned char*>(str);*p;++p) {
+      const unsigned cp=*p>=32 && *p<=126?*p:static_cast<unsigned>('?');
+      if(x+6*scale>352)break;
+      const uint8_t* glyph=glyphs[cp-32];
+      for(int gx=0;gx<5;++gx)
+        for(int gy=0;gy<7;++gy)
+          if(glyph[gx] & (1u<<gy))
+            renderer_.fillRect(x+gx*scale,top+gy*scale,scale,scale,true);
+      x+=6*scale;
+    }
+  }
+  void invertMenuRect(int x,int y,int w,int h) {
+    uint8_t* fb=display_.getFrameBuffer();
+    if(!fb)return;
+    for(int py=std::max(0,y);py<std::min(320,y+h);++py)
+      for(int px=std::max(0,x);px<std::min(375,x+w);++px)
+        fb[py*HalDisplay::DISPLAY_WIDTH_BYTES+px/8]^=
+          static_cast<uint8_t>(0x80u>>(px&7));
+  }
+  void showTypographyMenu(int selected) {
+    renderer_.clearScreen(0xff); // Do not reload and render the EPUB on each wheel step.
+    // The Q2 has a 360x320 logical viewport. Keep the heading and footer
+    // outside a bounded list; never paint eleven oversized rows at once.
+    constexpr int kItems=11;
+    constexpr int kRows=9;
+    constexpr int kRowTop=73;
+    constexpr int kRowHeight=21;
+    const int first=std::min(std::max(0,selected-kRows+1),kItems-kRows);
+    renderer_.fillRect(10,37,355,258,true);
+    renderer_.fillRect(12,39,351,254,false);
+    drawMenuText(22,47,"Reading settings");
+    renderer_.fillRect(18,66,337,1,true);
+    const char* labels[]={"Font","Size","Line spacing","Margins","Alignment",
+        "Hyphenation","Book CSS","Night mode","Add bookmark","Bookmarks","Chapters"};
+    const std::string values[]={
+      crosspod::typographyFamilyName(typography_.family),
+      std::to_string(typography_.size)+"pt",
+      std::to_string(preferences_.linePercent)+"%",
+      std::to_string(preferences_.margin)+"px",
+      preferences_.alignment?"Justify":"Book default",
+      preferences_.hyphenation?"On":"Off",
+      preferences_.embeddedStyle?"On":"Off",
+      preferences_.nightMode?"On":"Off",
+      "Save page","Saved pages","Browse book"
+    };
+    for(int row=0;row<kRows && first+row<kItems;++row) {
+      const int item=first+row;
+      const int y=kRowTop+row*kRowHeight;
+      const bool active=selected==item;
+      // Invert the completed row, including the glyph pixels, after drawing.
+      // Separate columns prevent long values from colliding with labels.
+      const std::string label=clippedLabel(labels[item],12);
+      const std::string value=clippedLabel(values[item],12);
+      drawMenuText(24,y+3,label.c_str());
+      drawMenuText(192,y+3,value.c_str());
+      if(active)invertMenuRect(18,y,337,kRowHeight);
+    }
+    renderer_.fillRect(18,267,337,1,true);
+    const std::string position=std::to_string(selected+1)+"/"+
+      std::to_string(kItems)+"  Wheel: scroll  Center: select";
+    drawMenuText(23,277,clippedLabel(position,48).c_str(),1);
+    if(!typographyNotice_.empty()) {
+      const std::string notice=clippedLabel(typographyNotice_,46);
+      drawMenuText(23,292,clippedLabel(notice,48).c_str(),1);
+    }
     display_.displayBuffer();
   }
   bool loadSpine(int index,int direction) {
@@ -801,14 +1176,36 @@ class Reader {
       if(upstreamEpub_ && index<upstreamEpub_->getSpineItemsCount()) {
         auto section=std::make_unique<Section>(upstreamEpub_,index,renderer_);
         const ReaderRenderSpec spec=upstreamSpec();
-        if((section->loadSectionFile(spec) ||
-            section->createSectionFile(spec)) && section->pageCount>0) {
+        // Restore complete/partial pages immediately. On a cache miss
+        // build only until the first page is available; the event loop will
+        // grow the original Section in bounded increments between inputs.
+        const bool cached=section->loadSectionFile(spec);
+        bool usable=cached && section->pageCount>0;
+        if(!cached && section->startBuild(spec)) {
+          while(section->isBuilding() && section->pageCount==0) {
+            if(!section->buildSomeMore(1))break;
+          }
+          usable=section->pageCount>0;
+        } else if(cached && section->isPartial() && section->startBuild(spec)) {
+          // Partial's cached pages remain immediately readable while the
+          // next incremental pass rebuilds its page LUT in the background.
+          usable=true;
+        }
+        if(usable) {
+          // Reading backwards across a spine requires its *actual* last
+          // page, never the partial watermark.
+          if(direction<0 && section->isBuilding()) {
+            if(!section->buildSomeMore(0))usable=false;
+          }
+        }
+        if(usable) {
           upstreamSection_=std::move(section);
           currentSpine_=index;
           currentPage_=direction<0?upstreamSection_->pageCount-1:0;
           pages_.clear();
-          std::printf("CrossPod original Section: spine %d/%d, %zu page(s)\n",
-              index+1,n,pageCount());
+          std::printf("CrossPod original Section: spine %d/%d, %zu page(s)%s\n",
+              index+1,n,pageCount(),
+              upstreamSection_->isBuilding()?" (incremental)":"");
           return true;
         }
         std::fprintf(stderr,
@@ -833,23 +1230,91 @@ class Reader {
     currentSpine_=oldSpine;
     return false;
   }
+  bool buildNextPages(int maxPages=1) {
+    if(!upstreamSection_ || !upstreamSection_->isBuilding())return false;
+    const size_t before=pageCount();
+    if(!upstreamSection_->buildSomeMore(maxPages)) {
+      std::fprintf(stderr,"CrossPod: incremental Section failed; preserving book via fallback\n");
+      const int spine=currentSpine_;
+      const size_t page=currentPage_;
+      upstreamEpub_.reset();
+      upstreamSection_.reset();
+      if(loadSpine(spine,1)) {
+        currentPage_=std::min(page,pageCount()-1);
+        persistPosition();
+      }
+      return true;
+    }
+    if(!upstreamSection_->isBuilding())
+      std::printf("CrossPod Section completed: %zu pages\n",pageCount());
+    return pageCount()!=before;
+  }
+  bool isBuilding() const {return upstreamSection_ && upstreamSection_->isBuilding();}
+  size_t estimatedPages() const {
+    return upstreamSection_?upstreamSection_->estimatedTotalPages():pageCount();
+  }
   bool move(int direction) {
+    if(direction>0 && currentPage_+1>=pageCount() && isBuilding()) {
+      (void)buildNextPages(2);
+      // No new page available yet: remain in this chapter until the
+      // incremental parser finishes. Never silently skip unread content.
+      if(isBuilding() && currentPage_+1>=pageCount())return false;
+    }
     if (direction>0 && currentPage_+1<pageCount()) { ++currentPage_; persistPosition(); return true; }
     if (direction<0 && currentPage_>0) { --currentPage_; persistPosition(); return true; }
     const bool changed=loadSpine(currentSpine_+direction,direction);
     if(changed)persistPosition();
     return changed;
   }
+  void applyNightMode() {
+    if(!preferences_.nightMode)return;
+    auto* buffer=display_.getFrameBuffer();
+    if(!buffer)return;
+    for(size_t i=0;i<display_.getBufferSize();++i)
+      buffer[i]=static_cast<uint8_t>(~buffer[i]);
+  }
+  void drawProgress() {
+    const int totalChapters=metadata_.getSpineCount();
+    if(totalChapters<=0 || currentSpine_<0)return;
+    const size_t localCount=std::max<size_t>(1,estimatedPages());
+    const float local=static_cast<float>(currentPage_+1)/localCount;
+    const float progress=std::clamp(
+      (static_cast<float>(currentSpine_)+local)/totalChapters,0.0f,1.0f);
+    const int filled=static_cast<int>(progress*347.0f);
+    renderer_.drawLine(14,314,361,314,true);
+    if(filled>0)renderer_.fillRect(14,312,filled,3,true);
+  }
+  void cacheRenderedPage() {
+    const uint8_t* framebuffer=display_.getFrameBuffer();
+    if(!framebuffer || currentSpine_<0)return;
+    auto& slot=rasterCache_[nextRasterSlot_++%rasterCache_.size()];
+    slot.spine=currentSpine_;
+    slot.page=currentPage_;
+    slot.pixels.assign(framebuffer,framebuffer+HalDisplay::BUFFER_SIZE);
+  }
   void render() {
+    uint8_t* framebuffer=display_.getFrameBuffer();
+    constexpr size_t kBytes=HalDisplay::BUFFER_SIZE;
+    if(framebuffer) {
+      for(const auto& cached:rasterCache_)
+        if(cached.spine==currentSpine_ && cached.page==currentPage_ &&
+           cached.pixels.size()==kBytes) {
+          std::memcpy(framebuffer,cached.pixels.data(),kBytes);
+          return;
+        }
+    }
     renderer_.clearScreen(0xff);
     if(upstreamSection_) {
       auto page=upstreamSection_->loadPage(static_cast<int>(currentPage_));
-      if(page)page->render(renderer_,upstreamFontId_,LEFT,TOP);
+      if(page)page->render(renderer_,upstreamFontId_,preferences_.margin,TOP);
+      drawProgress();
+      applyNightMode();
+      cacheRenderedPage();
       return;
     }
     const auto& page=pages_[currentPage_];
     for (const auto& line:page.lines)
-      line.block->render(renderer_,1,LEFT,line.y);
+      line.block->render(renderer_,1,preferences_.margin,line.y);
     // 4x4 ordered Bayer halftone; preserve image detail on Q2's 1-bit surface.
     static constexpr uint8_t bayer[4][4]={
       {0,8,2,10},{12,4,14,6},{3,11,1,9},{15,7,13,5}};
@@ -860,10 +1325,13 @@ class Reader {
           const size_t sx=static_cast<size_t>(dx)*image.png.width/image.width;
           const unsigned gray=image.png.gray[sy*image.png.width+sx];
           const unsigned threshold=static_cast<unsigned>(bayer[dy&3][dx&3])*16u+8u;
-          if(gray<threshold)renderer_.drawPixel(image.x+dx,image.y+dy,true);
+          if(gray<threshold)renderer_.drawPixel(image.x+dx+(preferences_.margin-14),image.y+dy,true);
         }
       }
     }
+    drawProgress();
+    applyNightMode();
+    cacheRenderedPage();
   }
   void present() {
     render();
@@ -989,8 +1457,10 @@ class CardShelf {
   FontDecompressor decompressor_;
   FontCacheManager fontCache_;
   size_t selected_ = 0;
+  bool browsing_ = false;
+  int homeSelection_ = 0;
   std::string notice_;
-  static constexpr int TOP_Y=59, ROW_H=36, VISIBLE_ROWS=6;
+  static constexpr int TOP_Y=80, ROW_H=38, VISIBLE_ROWS=5;
 
  public:
   explicit CardShelf(const std::vector<ShelfEntry>& books,size_t selection=0):
@@ -1012,17 +1482,34 @@ class CardShelf {
   }
   size_t selected() const {return selected_;}
   bool empty() const {return books_.empty();}
+  bool browsing() const {return browsing_;}
+  bool browseChosen() const {return !browsing_ && (homeSelection_==1 || books_.empty());}
+  void enterBrowser() {browsing_=true;notice_.clear();}
+  void goHome() {browsing_=false;homeSelection_=0;notice_.clear();}
   const std::string& bookPath() const {return books_[selected_].path;}
   bool change(int direction) {
+    notice_.clear();
+    if(!browsing_) {
+      const int next=std::clamp(homeSelection_+direction,0,1);
+      if(next==homeSelection_)return false;
+      homeSelection_=next;
+      return true;
+    }
     if(books_.empty())return false;
     const auto before=selected_;
     if(direction>0 && selected_+1<books_.size())++selected_;
     else if(direction<0 && selected_>0)--selected_;
-    notice_.clear();
     return selected_!=before;
   }
   bool tap(int x,int y) {
-    if(books_.empty() || x<0||x>=375 || y<TOP_Y || y>=TOP_Y+VISIBLE_ROWS*ROW_H)return false;
+    if(x<0||x>=375)return false;
+    if(!browsing_) {
+      if(y>=158&&y<195)homeSelection_=0;
+      else if(y>=204&&y<241)homeSelection_=1;
+      else return false;
+      return true;
+    }
+    if(books_.empty()||y<TOP_Y||y>=TOP_Y+VISIBLE_ROWS*ROW_H)return false;
     const size_t start=(selected_/VISIBLE_ROWS)*VISIBLE_ROWS;
     const size_t index=start+static_cast<size_t>((y-TOP_Y)/ROW_H);
     if(index>=books_.size())return false;
@@ -1030,33 +1517,80 @@ class CardShelf {
     return true;
   }
   void setNotice(std::string notice) {notice_=std::move(notice);}
+  // Draw compact ASCII interface labels using CrossPoint's existing
+  // glyph scaler. Reader/body fonts and multilingual fallbacks are unchanged.
+  void drawCompactLabel(int x,int baseline,const char* label,int scale=192) {
+    for(const unsigned char* cp=
+          reinterpret_cast<const unsigned char*>(label);*cp;++cp) {
+      if(*cp>=0x80)continue; // these fixed UI labels are ASCII
+      x+=renderer_.drawScaledCodepoint(1,*cp,
+          EpdFontFamily::REGULAR,x,baseline,scale);
+    }
+  }
   void paint() {
     renderer_.clearScreen(0xff);
-    renderer_.fillRect(0,0,375,43,true);
-    renderer_.drawText(1,17,16,"CrossPod",false);
-    char counter[80];
-    std::snprintf(counter,sizeof(counter),"%zu EPUB book%s",books_.size(),books_.size()==1?"":"s");
-    renderer_.drawText(1,18,45,counter);
-    if(books_.empty()) {
-      renderer_.drawText(1,18,112,"No EPUB books found.");
-      renderer_.drawText(1,18,144,"Copy books to /Books/");
+    // Fixed title and footer are outside both the home and file-list regions.
+    // Draw at 75% of the native 12pt font, then invert only the header
+    // raster so the compact text stays white against the dark title bar.
+    drawCompactLabel(16,23,"CrossPod");
+    uint8_t* fb=display_.getFrameBuffer();
+    for(int y=0;y<39;++y)
+      for(int byte=0;byte<HalDisplay::DISPLAY_WIDTH_BYTES;++byte)
+        fb[y*HalDisplay::DISPLAY_WIDTH_BYTES+byte]^=0xff;
+    if(!browsing_) {
+      drawCompactLabel(16,61,"Home");
+      renderer_.drawLine(15,74,359,74,true);
+      // A compact current-book panel, inspired by CrossPoint's home page.
+      // Do not invent book-cover artwork or draw filenames outside the panel.
+      renderer_.drawText(1,65,88,"Current book");
+      renderer_.drawLine(17,92,52,92,true);
+      renderer_.drawLine(17,92,17,138,true);
+      renderer_.drawLine(52,92,52,138,true);
+      renderer_.drawLine(17,138,52,138,true);
+      renderer_.drawLine(22,100,46,100,true);
+      renderer_.drawLine(22,106,46,106,true);
+      if(books_.empty())
+        renderer_.drawText(1,65,119,"No books yet");
+      else
+        renderer_.drawText(1,65,119,
+            clippedLabel(books_[selected_].label,20).c_str());
+      renderer_.drawLine(15,149,359,149,true);
+      if(!books_.empty()) {
+        if(homeSelection_==0)renderer_.fillRect(12,158,350,37,true);
+        renderer_.drawText(1,22,165,"Continue reading",homeSelection_!=0);
+      }
+      if(homeSelection_==1 || books_.empty())
+        renderer_.fillRect(12,204,350,37,true);
+      renderer_.drawText(1,22,211,"Browse files",
+          homeSelection_!=1 && !books_.empty());
     } else {
-      const size_t start=(selected_/VISIBLE_ROWS)*VISIBLE_ROWS;
-      for(size_t row=0;row<VISIBLE_ROWS && start+row<books_.size();++row) {
-        const size_t index=start+row;
-        const int y=TOP_Y+static_cast<int>(row)*ROW_H;
-        const bool active=index==selected_;
-        if(active)renderer_.fillRect(10,y+2,355,31,true);
-        else renderer_.drawLine(14,y+ROW_H-3,361,y+ROW_H-3,true);
-        const std::string label=clippedLabel(books_[index].label,34);
-        renderer_.drawText(1,18,y+10,label.c_str(),!active);
+      char count[64];
+      std::snprintf(count,sizeof(count),"Browse files (%zu)",books_.size());
+      drawCompactLabel(16,61,count);
+      renderer_.drawLine(15,72,359,72,true);
+      if(books_.empty()) {
+        renderer_.drawText(1,16,102,"No EPUB books found");
+        renderer_.drawText(1,16,144,"Copy EPUBs to /Books");
+      } else {
+        const size_t start=(selected_/VISIBLE_ROWS)*VISIBLE_ROWS;
+        for(size_t row=0;row<VISIBLE_ROWS && start+row<books_.size();++row) {
+          const size_t index=start+row;
+          const int y=TOP_Y+static_cast<int>(row)*ROW_H;
+          const bool active=index==selected_;
+          if(active)renderer_.fillRect(12,y,350,36,true);
+          else renderer_.drawLine(15,y+36,359,y+36,true);
+          const std::string label=clippedLabel(books_[index].label,22);
+          renderer_.drawText(1,22,y+7,label.c_str(),!active);
+        }
       }
     }
-    if(!notice_.empty()) {
-      renderer_.fillRect(0,272,375,20,true);
-      renderer_.drawText(1,12,277,clippedLabel(notice_,43).c_str(),false);
-    }
-    renderer_.drawText(1,18,299,"Wheel: select   Center: open   Back: exit");
+    // A single footer line; previous "Wheel: choose" at y=261 overlapped
+    // the dark footer and became partly invisible on the actual LCD.
+    renderer_.fillRect(0,269,375,51,true);
+    const std::string footer=!notice_.empty()
+      ?clippedLabel(notice_,24)
+      :browsing_?"OK: open   Back: home":"OK: open   Back: exit";
+    renderer_.drawText(1,22,280,footer.c_str(),false);
   }
   void present() {paint();display_.displayBuffer();}
   bool savePgm(const std::string& out) {
@@ -1092,34 +1626,95 @@ int runCardApp(const std::string& bookDir) {
   crosspod::Q2Controls controls;
   std::unique_ptr<Reader> reader;
   bool typeMenu=false;
+  bool navigationMenu=false;
+  bool showingBookmarks=false;
+  int navigationSelection=0;
   int typeSelection=0;
+  auto nextBuildTick=std::chrono::steady_clock::now();
   while(!interrupted) {
     crosspod::PhysicalEvent event{};
     if(!input.receive(event)) {
+      if(reader)reader->flushPosition(false);
+      const auto now=std::chrono::steady_clock::now();
+      if(reader && !typeMenu && !navigationMenu && reader->isBuilding() &&
+         now>=nextBuildTick) {
+        // One small Section step, no framebuffer refresh: growing the page
+        // cache must not flash the current page or monopolize the click wheel.
+        (void)reader->buildNextPages(2);
+        nextBuildTick=std::chrono::steady_clock::now()+
+                      std::chrono::milliseconds(90);
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
       continue;
     }
     const auto action=controls.translate(event).action;
+    nextBuildTick=std::chrono::steady_clock::now()+
+                  std::chrono::milliseconds(300);
     if(reader) {
+      if(navigationMenu) {
+        const int count=static_cast<int>(showingBookmarks?
+          reader->bookmarks().size():reader->chapterCount());
+        if(action==crosspod::LogicalAction::Back) {
+          navigationMenu=false;
+          reader->showTypographyMenu(typeSelection);
+        } else if(action==crosspod::LogicalAction::Next ||
+                  action==crosspod::LogicalAction::Previous) {
+          if(count)navigationSelection=std::clamp(
+            navigationSelection+(action==crosspod::LogicalAction::Next?1:-1),
+            0,count-1);
+          reader->showNavigationMenu(showingBookmarks,navigationSelection);
+        } else if(action==crosspod::LogicalAction::Confirm ||
+                  event.kind==crosspod::PhysicalKind::TouchUp) {
+          if(event.kind==crosspod::PhysicalKind::TouchUp)
+            navigationSelection=std::clamp(
+              (navigationSelection/7)*7+(event.y-81)/25,
+              0,std::max(0,count-1));
+          bool changed=false;
+          if(count && showingBookmarks) {
+            const auto marks=reader->bookmarks();
+            if(navigationSelection<static_cast<int>(marks.size()))
+              changed=reader->goToBookmark(marks[navigationSelection]);
+          } else if(count)changed=reader->goToChapter(navigationSelection);
+          if(changed) {
+            navigationMenu=false;
+            typeMenu=false;
+            reader->present();
+          } else reader->showNavigationMenu(showingBookmarks,navigationSelection);
+        }
+        continue;
+      }
       if(typeMenu) {
         if(action==crosspod::LogicalAction::Back) {
           typeMenu=false;
           reader->present();
         } else if(action==crosspod::LogicalAction::Previous ||
                   action==crosspod::LogicalAction::Next) {
-          typeSelection=1-typeSelection;
+          typeSelection=(typeSelection+
+              (action==crosspod::LogicalAction::Next?1:10))%11;
           reader->showTypographyMenu(typeSelection);
         } else if(action==crosspod::LogicalAction::Confirm ||
                   event.kind==crosspod::PhysicalKind::TouchUp) {
           if(event.kind==crosspod::PhysicalKind::TouchUp)
-            typeSelection=event.y>=143?1:0;
-          auto next=reader->typography();
-          if(typeSelection==0) {
-            next.family=next.family==crosspod::Typography::Family::Sans?
-              crosspod::Typography::Family::Serif:crosspod::Typography::Family::Sans;
-          } else next.size=next.size==12?14:(next.size==14?16:(next.size==16?18:12));
-          (void)reader->configureTypography(next);
-          reader->showTypographyMenu(typeSelection);
+            typeSelection=std::clamp(std::min(10,std::max(0,typeSelection-8))+
+                (event.y-73)/21,0,10);
+          if(typeSelection==8) {
+            (void)reader->rememberPage();
+          } else if(typeSelection>=9) {
+            showingBookmarks=typeSelection==9;
+            navigationMenu=true;
+            navigationSelection=showingBookmarks?0:reader->currentChapter();
+          } else if(typeSelection>=2)(void)reader->adjustPreference(typeSelection);
+          else {
+            auto next=reader->typography();
+            if(typeSelection==0) {
+              next.family=next.family==crosspod::Typography::Family::Sans?
+                crosspod::Typography::Family::Serif:crosspod::Typography::Family::Sans;
+            } else next.size=12; // Only 12pt fonts are verified in the Q2 package.
+            (void)reader->configureTypography(next);
+          }
+          if(navigationMenu)
+            reader->showNavigationMenu(showingBookmarks,navigationSelection);
+          else reader->showTypographyMenu(typeSelection);
         }
         continue;
       }
@@ -1145,12 +1740,21 @@ int runCardApp(const std::string& bookDir) {
       if(changed)reader->present();
       continue;
     }
-    if(action==crosspod::LogicalAction::Back)break;
+    if(action==crosspod::LogicalAction::Back) {
+      if(shelf->browsing()) {shelf->goHome();shelf->present();continue;}
+      break;
+    }
     if(action==crosspod::LogicalAction::Previous && shelf->change(-1))shelf->present();
     if(action==crosspod::LogicalAction::Next && shelf->change(1))shelf->present();
     bool activate=action==crosspod::LogicalAction::Confirm;
     if(event.kind==crosspod::PhysicalKind::TouchUp)activate=shelf->tap(event.x,event.y);
-    if(!activate || shelf->empty())continue;
+    if(!activate)continue;
+    if(shelf->browseChosen()) {
+      shelf->enterBrowser();
+      shelf->present();
+      continue;
+    }
+    if(shelf->empty())continue;
     selection=shelf->selected();
     const std::string chosen=shelf->bookPath();
     shelf->setNotice("Opening EPUB...");
@@ -1175,6 +1779,7 @@ void usage() {
     "Usage:\n"
     "  crosspod-reader --validate <book.epub>       (no framebuffer)\n"
     "  crosspod-reader --walk <book.epub>           (test pagination)\n"
+    "  crosspod-reader --bench <book.epub>          (latency & memory)\n"
     "  crosspod-reader --list-books <directory>     (card scanner test)\n"
     "  crosspod-reader --card-preview <dir> <out.pgm> (menu raster test)\n"
     "  crosspod-reader (no args)                    (Q2 card app)\n"
@@ -1190,6 +1795,12 @@ int main(int argc,char** argv) {
   if(argc==3 && std::strcmp(argv[1],"--list-books")==0) {
     const auto books=scanCardBooks(argv[2]);
     for(const auto& b:books)std::printf("%s\n",b.path.c_str());
+    return 0;
+  }
+  if(argc==3 && std::strcmp(argv[1],"--inspect-toc")==0) {
+    Reader reader(argv[2]);
+    if(!reader.open())return 3;
+    reader.dumpToc();
     return 0;
   }
   if(argc==4 && std::strcmp(argv[1],"--render-images")==0) {
@@ -1228,12 +1839,14 @@ int main(int argc,char** argv) {
     CardShelf shelf(books);
     return shelf.open() && shelf.savePgm(argv[3])?0:4;
   }
-  bool dry=false,render=false,walk=false;
+  bool dry=false,render=false,walk=false,benchmark=false;
   std::string path,output;
   if(argc==3 && std::strcmp(argv[1],"--validate")==0) {
     dry=true;path=argv[2];
   } else if(argc==3 && std::strcmp(argv[1],"--walk")==0) {
     dry=true;walk=true;path=argv[2];
+  } else if(argc==3 && std::strcmp(argv[1],"--bench")==0) {
+    dry=true;benchmark=true;path=argv[2];
   } else if(argc==4 && std::strcmp(argv[1],"--render")==0) {
     dry=true;render=true;path=argv[2];output=argv[3];
   } else if (argc==2 && argv[1][0] != '-') {
@@ -1243,17 +1856,48 @@ int main(int argc,char** argv) {
     std::fputs("CrossPod: only EPUB is supported in this device preview\n",stderr);
     return 2;
   }
+  const auto openStart=std::chrono::steady_clock::now();
   Reader reader(std::move(path));
   if (!reader.open()) {
     std::fputs("CrossPod: EPUB not supported by current reader slice\n",stderr);
     return 3;
   }
   if(dry) {
+    if(benchmark) {
+      const auto started=std::chrono::steady_clock::now();
+      size_t advanced=0;
+      constexpr size_t SAMPLE_PAGES=64;
+      while(advanced<SAMPLE_PAGES) {
+        if(reader.move(1)) {++advanced;continue;}
+        if(!reader.isBuilding())break;
+        (void)reader.buildNextPages(4);
+      }
+      const auto elapsed=std::chrono::steady_clock::now();
+      struct rusage usage{};
+      (void)getrusage(RUSAGE_SELF,&usage);
+      const auto openMs=std::chrono::duration_cast<std::chrono::milliseconds>(
+        started-openStart).count();
+      const auto turnMs=std::chrono::duration_cast<std::chrono::milliseconds>(
+        elapsed-started).count();
+      std::printf("CrossPod benchmark: open_ms=%lld sample_pages=%zu walk_ms=%lld maxrss_kb=%ld\n",
+        static_cast<long long>(openMs),advanced,
+        static_cast<long long>(turnMs),usage.ru_maxrss);
+      return 0;
+    }
     if(walk) {
       // Exercise real page/spine transitions and the backward boundary.
       // Limit iterations defensively for corrupt EPUBs.
       size_t forward=0,backward=0;
-      while(forward<65536 && reader.move(1))++forward;
+      while(forward<65536) {
+        if(reader.move(1)) {++forward;continue;}
+        // A page may not have been produced by the latest incremental
+        // parse chunk; don't mistake its temporary watermark for EOF.
+        if(reader.isBuilding()) {
+          (void)reader.buildNextPages(4);
+          continue;
+        }
+        break;
+      }
       if(forward>=65536)return 7;
       while(backward<65536 && reader.move(-1))++backward;
       if(backward>=65536||forward!=backward)return 8;
@@ -1290,18 +1934,22 @@ int main(int argc,char** argv) {
         reader.present();
       } else if(action==crosspod::LogicalAction::Previous ||
                 action==crosspod::LogicalAction::Next) {
-        typeSelection=1-typeSelection;
+        typeSelection=(typeSelection+
+            (action==crosspod::LogicalAction::Next?1:6))%7;
         reader.showTypographyMenu(typeSelection);
       } else if(action==crosspod::LogicalAction::Confirm ||
                 event.kind==crosspod::PhysicalKind::TouchUp) {
         if(event.kind==crosspod::PhysicalKind::TouchUp)
-          typeSelection=event.y>=143?1:0;
-        auto next=reader.typography();
-        if(typeSelection==0)
-          next.family=next.family==crosspod::Typography::Family::Sans?
-            crosspod::Typography::Family::Serif:crosspod::Typography::Family::Sans;
-        else next.size=next.size==12?14:(next.size==14?16:(next.size==16?18:12));
-        (void)reader.configureTypography(next);
+          typeSelection=std::clamp((event.y-73)/21,0,6);
+        if(typeSelection>=2)(void)reader.adjustPreference(typeSelection);
+        else {
+          auto next=reader.typography();
+          if(typeSelection==0)
+            next.family=next.family==crosspod::Typography::Family::Sans?
+              crosspod::Typography::Family::Serif:crosspod::Typography::Family::Sans;
+          else next.size=12; // Only 12pt fonts are verified in the Q2 package.
+          (void)reader.configureTypography(next);
+        }
         reader.showTypographyMenu(typeSelection);
       }
       continue;

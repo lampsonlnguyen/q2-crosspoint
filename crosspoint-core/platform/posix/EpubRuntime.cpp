@@ -5,6 +5,8 @@
 #include "Epub/Epub.h"
 #include <ContainerParser.h>
 #include <ContentOpfParser.h>
+#include <TocNavParser.h>
+#include <TocNcxParser.h>
 #include <ZipFile.h>
 #include <HalStorage.h>
 
@@ -58,6 +60,7 @@ bool Epub::load(bool buildIfMissing,bool skipLoadingCss) {
   auto& cache=*bookMetadataCache;
   if(!cache.beginWrite()||!cache.beginContentOpfPass())return false;
   BookMetadataCache::BookMetadata info;
+  std::string tocNavPath,tocNcxPath;
   {
     ContentOpfParser parser(cachePath,contentBasePath,n,&cache,false);
     if(!parser.setup() || !zip.readFileToStream(opf.c_str(),parser,1024))
@@ -67,9 +70,36 @@ bool Epub::load(bool buildIfMissing,bool skipLoadingCss) {
     info.language=parser.language;
     info.coverItemHref=parser.coverItemHref;
     info.textReferenceHref=parser.textReferenceHref;
+    tocNavPath=parser.tocNavPath;
+    tocNcxPath=parser.tocNcxPath;
   }
-  if(!cache.endContentOpfPass() || !cache.beginTocPass() ||
-     !cache.endTocPass() || !cache.endWrite() ||
+  if(!cache.endContentOpfPass() || !cache.beginTocPass())return false;
+  // Use the original CrossPoint EPUB3 nav.xhtml and EPUB2 toc.ncx parsers.
+  // Entries preserve chapter titles, anchors and nested TOC depth.
+  const auto parseToc=[&](const std::string& relative,bool isNav) {
+    if(relative.empty() || relative.size()>512 || relative.front()=='/' ||
+       relative.find("..")!=std::string::npos ||
+       relative.find('\\')!=std::string::npos)return false;
+    const std::string archivePath=
+       relative.rfind(contentBasePath,0)==0?relative:contentBasePath+relative;
+    size_t bytes=0;
+    if(!zip.getInflatedFileSize(archivePath.c_str(),&bytes) ||
+       !bytes || bytes>1024u*1024u)return false;
+    const size_t slash=archivePath.find_last_of('/');
+    const std::string navBase=
+       slash==std::string::npos?"":archivePath.substr(0,slash+1);
+    if(isNav) {
+      TocNavParser parser(navBase,bytes,&cache);
+      return parser.setup()&&zip.readFileToStream(archivePath.c_str(),parser,1024);
+    }
+    TocNcxParser parser(navBase,bytes,&cache);
+    return parser.setup()&&zip.readFileToStream(archivePath.c_str(),parser,1024);
+  };
+  const bool tocLoaded=parseToc(tocNavPath,true)||
+                       parseToc(tocNcxPath,false);
+  std::printf("CrossPod original TOC: %s\n",
+              tocLoaded?"EPUB nav/NCX parsed":"spine-only fallback");
+  if(!cache.endTocPass() || !cache.endWrite() ||
      !cache.buildBookBin(filepath,info) || !cache.load() ||
      cache.getSpineCount()==0)return false;
   if(!skipLoadingCss && cssParser) {

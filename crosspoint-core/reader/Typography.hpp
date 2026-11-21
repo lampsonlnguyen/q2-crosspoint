@@ -17,7 +17,7 @@ struct Typography {
 inline bool validTypography(const Typography& t) {
   return (t.family==Typography::Family::Sans ||
           t.family==Typography::Family::Serif) &&
-         (t.size==12 || t.size==14 || t.size==16 || t.size==18);
+         (t.size==12);
 }
 inline const char* typographyFamilyName(Typography::Family f) {
   return f==Typography::Family::Serif?"Serif":"Sans";
@@ -35,7 +35,7 @@ inline std::string typographyFontPath(Typography t) {
 // Shared CJK fallback is the original CrossPoint NotoSansCJKJP .cpfont v4.
 // This does not replace the reader's selected Sans/Serif face for Latin text.
 inline std::string typographyCjkFontPath(int size) {
-  if(size!=12 && size!=14 && size!=16 && size!=18)return {};
+  if(size!=12)return {};
   return typographyRoot()+"/fonts/cjk-"+std::to_string(size)+".cpfont";
 }
 inline bool loadTypography(Typography& value) {
@@ -50,6 +50,9 @@ inline bool loadTypography(Typography& value) {
   Typography read{std::strcmp(family,"serif")==0?
     Typography::Family::Serif:Typography::Family::Sans,size};
   if(std::strcmp(family,"serif")!=0 && std::strcmp(family,"sans")!=0)return false;
+  // Migrate saved 14/16/18pt preferences to the new 12pt ceiling.
+  // Keep the existing file format so upgrades do not erase other settings.
+  if(read.size>12)read.size=12;
   if(!validTypography(read))return false;
   value=read;
   return true;
