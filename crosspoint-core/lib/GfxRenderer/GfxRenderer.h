@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 
 #include <EpdFontFamily.h>
 #include <HalDisplay.h>
@@ -105,7 +106,7 @@ class GfxRenderer {
   // cannot render, the whole string is routed to the mapped fallback so it
   // appears at the same point size as the surrounding UI text. Populated by the
   // app-level SD font setup when an SD family is loaded. See resolveTextFontId().
-  std::map<int, int> fallbackFontMap_;
+  std::map<int, std::vector<int>> fallbackFontMap_;
   FontVariantProvider fontVariantProvider_;
 
   // If `text` contains a CJK codepoint that `fontId` cannot render and `fontId`
@@ -185,7 +186,16 @@ class GfxRenderer {
   const std::map<int, TtfEpdFont*>& getTtfFonts() const { return ttfFonts_; }
   // Register/clear size-matched CJK UI fallbacks (see fallbackFontMap_).
   // setFallbackFont maps a primary UI font id to an SD font id of the same size.
-  void setFallbackFont(int primaryFontId, int fallbackFontId) { fallbackFontMap_[primaryFontId] = fallbackFontId; }
+  void setFallbackFont(int primaryFontId, int fallbackFontId) {
+    fallbackFontMap_[primaryFontId] = {fallbackFontId};
+  }
+  // Ordered SD-font fallbacks. Multiple scripts can be supported without
+  // replacing the selected typography font or loading every bitmap into RAM.
+  void addFallbackFont(int primaryFontId, int fallbackFontId) {
+    auto& fonts = fallbackFontMap_[primaryFontId];
+    if (std::find(fonts.begin(), fonts.end(), fallbackFontId) == fonts.end())
+      fonts.push_back(fallbackFontId);
+  }
   void clearFallbackFonts() { fallbackFontMap_.clear(); }
 
   void setFontVariantProvider(const FontVariantProvider& provider) { fontVariantProvider_ = provider; }

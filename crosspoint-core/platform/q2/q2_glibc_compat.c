@@ -37,3 +37,10 @@ void arc4random_buf(void *buffer, size_t length) {
 // glibc >=2.32 optimization hook; Q2 glibc 2.28 lacks it.
 // Always use thread-safe atomic reference counts instead of assuming single thread.
 char __libc_single_threaded = 0;
+
+// The original Section parser uses strtol; newer Ubuntu MIPS headers redirect
+// it to a C23 symbol absent from the Q2 firmware's glibc 2.28.
+extern long q2_legacy_strtol(const char*,char**,int) __asm__("strtol");
+long __isoc23_strtol(const char* value,char** end,int base) {
+  return q2_legacy_strtol(value,end,base);
+}

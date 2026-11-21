@@ -57,11 +57,30 @@ CrossPod repaginates the current chapter and saves your choices in
 /mnt/mmc/.crosspod/typography.conf. The book's page number may shift when
 font size changes; location anchoring is still a follow-up.
 
-The card app CI downloads exactly two original CrossPoint .cpfont families:
-NotoSansExtended and NotoSerifExtended (each in 12/14/16/18pt), supplied
-from the official crosspoint-reader/crosspoint-fonts sd-fonts-m1-b4 release.
-They're installed under .crosspod/fonts/ in the card-app ZIP.
-An older ZIP without these files supports only built-in Sans 12.
-Font loading or repagination failure is shown in the menu and retains the
-previous setting. Full language coverage depends on each font's glyph set.
-Original font notices and release: https://github.com/crosspoint-reader/crosspoint-fonts
+The card app CI installs the original CrossPoint NotoSansExtended and
+NotoSerifExtended 12/14/16/18pt faces. It also installs upstream
+NotoSansCJKJP (Japanese and common Chinese), Pretendard (Korean Hangul),
+NotoSansDevanagari (Hindi, Marathi, Nepali), NotoSansBengali (Bengali),
+NotoSansGujarati, NotoSansGurmukhi (Punjabi), NotoSansKannada,
+NotoSansMalayalam, NotoSansOriya (Odia), NotoSansSinhala, NotoSansTamil,
+NotoSansTelugu, NotoNaskhArabicUI (Arabic), and Alef (Hebrew). Each
+fallback family is present at 12/14/16/18pt. All packages are downloaded
+from the official CrossPoint fonts release with pinned SHA-256 checksums.
+The optional script faces stay on SD until their glyphs are requested.
+
+Fallback selection checks glyph coverage for each word and routes it to
+the available original CrossPoint font covering the most missing glyphs.
+The Sans/Serif preference remains primary. One font per word means mixed-script
+words requiring multiple fallback faces can still be incomplete. The upstream
+font inventory does not currently contain every language/script in Unicode,
+and Devanagari/Arabic/other complex shaping fidelity is limited by the
+underlying CrossPoint shaping engine. No Thai or Khmer fonts are in the
+selected upstream release. For Chinese, the CJK font uses Japanese regional
+Han forms; distinct Simplified Chinese glyph shapes are not guaranteed.
+Font files do not imply support for every language or every ligature.
+
+The expanded font assets increase the ZIP substantially. Install to SD root
+with adequate space and retain the complete .crosspod/fonts folder.
+An older ZIP with missing script files still opens using available fonts;
+startup logs report the count of loaded script families. See the upstream
+catalog at https://github.com/crosspoint-reader/crosspoint-fonts

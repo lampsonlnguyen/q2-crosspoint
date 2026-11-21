@@ -32,6 +32,12 @@ inline std::string typographyFontPath(Typography t) {
     (t.family==Typography::Family::Serif?std::string("serif-"):std::string("sans-"))+
     std::to_string(t.size)+".cpfont";
 }
+// Shared CJK fallback is the original CrossPoint NotoSansCJKJP .cpfont v4.
+// This does not replace the reader's selected Sans/Serif face for Latin text.
+inline std::string typographyCjkFontPath(int size) {
+  if(size!=12 && size!=14 && size!=16 && size!=18)return {};
+  return typographyRoot()+"/fonts/cjk-"+std::to_string(size)+".cpfont";
+}
 inline bool loadTypography(Typography& value) {
   const std::string path=typographyRoot()+"/typography.conf";
   std::FILE* f=std::fopen(path.c_str(),"rb");

@@ -398,13 +398,25 @@ add_test(NAME crosspoint_vietnamese_book_page_preview
 add_executable(crosspod-reader
     reader/crosspod_reader.cpp
     reader/JpegPreview.c
+    platform/posix/EpubRuntime.cpp
+    platform/posix/ImageDecoderFactory.cpp
+    lib/Epub/converters/ImageDimsProbe.cpp
+    lib/Epub/htmlEntities.cpp
+    lib/Epub/blocks/ImageBlock.cpp
+    lib/Epub/Page.cpp
+    lib/Epub/Section.cpp
+    lib/Epub/parsers/ChapterHtmlSlimParser.cpp
     lib/Epub/ParsedText.cpp
     lib/Epub/blocks/TextBlock.cpp
     $<TARGET_OBJECTS:crosspoint_renderer_objects>)
+# The upstream parser uses Arduino time helpers; POSIX supplies these shims.
+set_source_files_properties(lib/Epub/parsers/ChapterHtmlSlimParser.cpp
+    lib/Epub/Section.cpp PROPERTIES
+    COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/platform/posix/ArduinoCompat.h")
 target_include_directories(crosspod-reader PRIVATE
     lib lib/Epub lib/Epub/Epub lib/Epub/parsers lib/Epub/blocks
     lib/Epub/css lib/EpdFont lib/GfxRenderer lib/Utf8 lib/MiniBidi
-    lib/Memory lib/Serialization platform/posix platform/q2)
+    lib/Memory lib/Serialization lib/XmlParserUtils reader platform/posix platform/q2)
 target_compile_definitions(crosspod-reader PRIVATE CROSSPOD_LINUX=1)
 set_target_properties(crosspod-reader PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 target_link_libraries(crosspod-reader PRIVATE
@@ -521,6 +533,35 @@ add_test(NAME crosspod_reader_png_and_jpeg
       "$<TARGET_FILE:crosspod-reader>" "${ILLUSTRATED_EPUB_FIXTURE}"
       "${CMAKE_CURRENT_BINARY_DIR}/jpeg-png-page.pgm")
 
+# Chinese/Japanese EPUB. Q2 hardware build renders this through the original
+# CrossPoint Section and verifies CJK glyph fallback is actually used.
+set(CJK_EPUB_FIXTURE "${CMAKE_CURRENT_BINARY_DIR}/cjk-script.epub")
+add_custom_command(OUTPUT "${CJK_EPUB_FIXTURE}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/make_cjk_epub_fixture.py" "${CJK_EPUB_FIXTURE}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/make_cjk_epub_fixture.py"
+    VERBATIM)
+add_custom_target(cjk_epub_fixture ALL DEPENDS "${CJK_EPUB_FIXTURE}")
+add_dependencies(crosspod-reader cjk_epub_fixture)
+add_test(NAME crosspod_reader_cjk_original_section
+    COMMAND crosspod-reader --validate "${CJK_EPUB_FIXTURE}")
+
+# Script fixtures: Korean/Hindi are release gates, other upstream scripts
+# are parsed as real EPUBs to ensure UTF-8 survives the original Section path.
+foreach(script korean devanagari bengali gujarati gurmukhi kannada malayalam
+               oriya sinhala tamil telugu arabic hebrew)
+    set(script_epub "${CMAKE_CURRENT_BINARY_DIR}/script-${script}.epub")
+    add_custom_command(OUTPUT "${script_epub}"
+      COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/make_multiscript_epub_fixture.py"
+        "${script}" "${script_epub}"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/make_multiscript_epub_fixture.py"
+      VERBATIM)
+    add_custom_target("crosspod_fixture_${script}" ALL DEPENDS "${script_epub}")
+    add_dependencies(crosspod-reader "crosspod_fixture_${script}")
+    add_test(NAME "crosspod_original_script_${script}"
+      COMMAND crosspod-reader --validate "${script_epub}")
+endforeach()
+
 # CrossPoint's actual XHTML chapter parser is compiled directly as a gate.
 # Compile only until missing FreeInk image codecs and reading activity
 # dependencies can be ported; this is not a linked reader.
@@ -567,3 +608,35 @@ target_include_directories(crosspoint_section_objects PRIVATE
     lib/XmlParserUtils
     platform/posix
 )
+
+# Experimental FULL upstream reader link gate. Unlike the compile-only gates
+# above this deliberately resolves every reference used by the original
+# ChapterHtmlSlimParser, Section and Page. It must pass before switching the
+# Q2 user-facing reader to the original section engine.
+add_executable(crosspoint_original_engine_link_tests
+    tests/original_section_runtime_test.cpp
+    lib/Epub/blocks/ImageBlock.cpp
+    platform/posix/EpubRuntime.cpp
+    platform/posix/ImageDecoderFactory.cpp
+    reader/JpegPreview.c
+    lib/Epub/converters/ImageDimsProbe.cpp
+    lib/Epub/htmlEntities.cpp
+    $<TARGET_OBJECTS:crosspoint_xhtml_parser_objects>
+    $<TARGET_OBJECTS:crosspoint_section_objects>
+    $<TARGET_OBJECTS:crosspoint_pagination_objects>
+    $<TARGET_OBJECTS:crosspoint_renderer_objects>)
+target_include_directories(crosspoint_original_engine_link_tests PRIVATE
+    lib lib/Epub lib/Epub/Epub lib/Epub/parsers lib/Epub/blocks
+    lib/Epub/css lib/EpdFont lib/GfxRenderer lib/Utf8 lib/MiniBidi
+    lib/Memory lib/Serialization lib/XmlParserUtils reader platform/posix platform/q2)
+target_compile_definitions(crosspoint_original_engine_link_tests PRIVATE CROSSPOD_LINUX=1)
+set_target_properties(crosspoint_original_engine_link_tests PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+target_link_libraries(crosspoint_original_engine_link_tests PRIVATE
+    crosspoint_zip crosspoint_epub_container crosspoint_opf
+    crosspoint_book_cache crosspoint_hyphenation crosspoint_linebreak
+    crosspoint_q2_hal_display crosspoint_font_metrics crosspoint_bidi
+    crosspoint_layout_foundation crosspoint_utf8 EXPAT::EXPAT ZLIB::ZLIB JPEG::JPEG)
+add_dependencies(crosspoint_original_engine_link_tests epub_fixture illustrated_epub_fixture)
+target_compile_options(crosspoint_original_engine_link_tests PRIVATE -UNDEBUG)
+add_test(NAME crosspoint_original_engine_real_layout
+    COMMAND crosspoint_original_engine_link_tests "${EPUB_FIXTURE}")

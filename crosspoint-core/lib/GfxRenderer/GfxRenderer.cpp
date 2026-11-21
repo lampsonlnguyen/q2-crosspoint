@@ -319,35 +319,31 @@ void GfxRenderer::insertFont(const int fontId, EpdFontFamily font) {
 }
 
 int GfxRenderer::resolveTextFontId(const int fontId, const char* text, const EpdFontFamily::Style style) const {
-  if (fallbackFontMap_.empty() || text == nullptr || *text == '\0') {
-    return fontId;
-  }
-  const auto fbIt = fallbackFontMap_.find(fontId);
-  if (fbIt == fallbackFontMap_.end()) {
-    return fontId;  // no fallback registered for this font
-  }
-  const int fallbackFontId = fbIt->second;
-  const auto fontIt = fontMap.find(fontId);
-  const auto fallbackIt = fontMap.find(fallbackFontId);
-  if (fontIt == fontMap.end() || fallbackIt == fontMap.end()) {
-    return fontId;  // unknown primary or fallback not loaded — let the caller handle it
-  }
-  const EpdFontFamily& primary = fontIt->second;
-  const EpdFontFamily& fallback = fallbackIt->second;
-  const char* cursor = text;
-  uint32_t cp;
-  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&cursor)))) {
-    // Redirect whenever the primary font cannot draw a codepoint the fallback
-    // can — otherwise the string renders with holes. Not just CJK: Greek,
-    // Cyrillic, or any script the built-in UI fonts lack qualifies. ASCII is
-    // skipped outright (every registered font covers it), keeping Latin
-    // strings on the fast path, and a partial-coverage fallback is not worth
-    // dragging the whole string into for glyphs it would also miss.
-    if (cp >= 0x80 && !primary.hasCodepoint(cp, style) && fallback.hasCodepoint(cp, style)) {
-      return fallbackFontId;
+  if(fallbackFontMap_.empty() || !text || !*text)return fontId;
+  const auto found=fallbackFontMap_.find(fontId);
+  if(found==fallbackFontMap_.end())return fontId;
+  const auto primaryIt=fontMap.find(fontId);
+  if(primaryIt==fontMap.end())return fontId;
+  const EpdFontFamily& primary=primaryIt->second;
+
+  // Select the font covering the most missing codepoints, without treating
+  // one available glyph as sufficient. No allocation: bounded list of script
+  // fonts and a single pass over each (usually short) word.
+  size_t bestMissing=0;
+  int bestFont=fontId;
+  for(const int fallbackId:found->second) {
+    const auto candidate=fontMap.find(fallbackId);
+    if(candidate==fontMap.end())continue;
+    size_t coverage=0;
+    const char* cursor=text;
+    uint32_t cp=0;
+    while((cp=utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&cursor)))) {
+      if(cp>=0x80 && !primary.hasCodepoint(cp,style) &&
+         candidate->second.hasCodepoint(cp,style))++coverage;
     }
+    if(coverage>bestMissing){bestMissing=coverage;bestFont=fallbackId;}
   }
-  return fontId;
+  return bestFont;
 }
 
 void GfxRenderer::prewarmFallbackText(const int fontId, const TextGetter getter, const void* ctx,

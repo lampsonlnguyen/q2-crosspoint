@@ -91,7 +91,12 @@ elf="$work/reader/crosspod-reader"
 python3 crosspoint-core/tools/check_q2_elf.py "$elf" mipsel-linux-gnu-readelf mipsel-linux-gnu-objdump
 echo "C++ ABI requirements:"
 mipsel-linux-gnu-readelf -Ws "$elf" | grep 'GLIBCXX_' | sort -u | tail -25 || true
-timeout 60s qemu-mipsel -L "$root" "$elf" --validate "$work/reader/multilingual.epub"
+timeout 60s qemu-mipsel -L "$root" "$elf" --validate "$work/reader/multilingual.epub" | tee "$work/upstream-validation.log"
+grep -q "CrossPod original Section:" "$work/upstream-validation.log"
+# The prior collector stays as a rescue mode for incompatible EPUBs.
+CROSSPOD_ENGINE=legacy timeout 60s qemu-mipsel -L "$root" "$elf" \
+  --validate "$work/reader/multilingual.epub" | tee "$work/legacy-validation.log"
+grep -q "CrossPod legacy fallback:" "$work/legacy-validation.log"
 timeout 60s qemu-mipsel -L "$root" "$elf" --walk "$work/reader/multilingual.epub"
 
 # Exercise the same bounded streaming path on actual Q2 MIPS ABI, including
@@ -105,6 +110,7 @@ python3 crosspoint-core/tests/xhtml_streaming_test.py \
   "$work/reader-qemu" "$work/reader/illustrated.epub"
 timeout 60s qemu-mipsel -L "$root" "$elf" --render "$work/reader/vietnamese-prose.epub" "$work/vietnamese.pgm"
 timeout 60s qemu-mipsel -L "$root" "$elf" --render-images "$work/reader/illustrated.epub" "$work/illustrated.pgm" | tee "$work/images.log"
+grep -q "CrossPod original Section:" "$work/images.log"
 grep -q "CrossPod rendered images: 2" "$work/images.log"
 python3 - "$work/vietnamese.pgm" "$work/illustrated.pgm" <<'PY'
 from pathlib import Path
@@ -128,6 +134,60 @@ cp "$work/reader/vietnamese-prose.epub" "$card/Books/"
 # Original CrossPoint font files, pinned to verified official SHA-256 digests.
 python3 crosspoint-core/tools/fetch_q2_fonts.py "$card/.crosspod/fonts"
 cp crosspoint-core/lib/EpdFont/builtinFonts/NotoSans-OFL.txt "$card/.crosspod/NotoSans-OFL.txt"
+
+# Full script pack must load on MIPS, not just be copied into the ZIP.
+CROSSPOD_STATE_DIR="$card/.crosspod" timeout 90s qemu-mipsel -L "$root" "$elf" \
+  --validate "$work/reader/script-korean.epub" | tee "$work/korean-validate.log"
+grep -q 'CrossPod multilingual fonts: 14/14 scripts loaded (12pt)' "$work/korean-validate.log"
+grep -q 'CrossPod original Section:' "$work/korean-validate.log"
+
+for script in korean devanagari; do
+  file="$work/reader/script-$script.epub"
+  CROSSPOD_STATE_DIR="$card/.crosspod" timeout 90s qemu-mipsel -L "$root" "$elf" \
+    --render "$file" "$work/$script-enabled.pgm" | tee "$work/$script-enabled.log"
+  CROSSPOD_DISABLE_SCRIPTS="$script" CROSSPOD_STATE_DIR="$card/.crosspod" \
+    timeout 90s qemu-mipsel -L "$root" "$elf" \
+    --render "$file" "$work/$script-disabled.pgm" | tee "$work/$script-disabled.log"
+  grep -q 'CrossPod original Section:' "$work/$script-enabled.log"
+  python3 - "$work/$script-enabled.pgm" "$work/$script-disabled.pgm" "$script" <<'PY'
+from pathlib import Path
+import sys
+active, disabled = (Path(p).read_bytes() for p in sys.argv[1:3])
+assert active.startswith(b"P5\n375 320\n255\n")
+assert len(active)==len(disabled)==120015
+delta=sum(a!=b for a,b in zip(active[15:],disabled[15:]))
+assert delta>100, f"{sys.argv[3]} glyph fallback ineffective: {delta}"
+print(f"Q2 script raster {sys.argv[3]}: PASS ({delta} changed pixels)")
+PY
+done
+
+
+# Genuine Chinese/Japanese regression: the pinned CrossPoint CJK font must be
+# loaded under the real Q2 MIPS ABI. Compare exact rasters against the
+# explicitly disabled-fallback control, not just the process exit code.
+CROSSPOD_STATE_DIR="$card/.crosspod" timeout 90s qemu-mipsel -L "$root" "$elf" \
+  --render "$work/reader/cjk-script.epub" "$work/cjk-active.pgm" \
+  | tee "$work/cjk-active.log"
+grep -q 'CrossPod original Section:' "$work/cjk-active.log"
+grep -q 'CrossPod CJK fallback: original CrossPoint NotoSansCJKJP cpfont 12pt' "$work/cjk-active.log"
+CROSSPOD_DISABLE_CJK=1 CROSSPOD_STATE_DIR="$card/.crosspod" \
+  timeout 90s qemu-mipsel -L "$root" "$elf" \
+  --render "$work/reader/cjk-script.epub" "$work/cjk-disabled.pgm" \
+  | tee "$work/cjk-disabled.log"
+grep -q 'CrossPod CJK fallback: unavailable 12pt' "$work/cjk-disabled.log"
+python3 - "$work/cjk-active.pgm" "$work/cjk-disabled.pgm" <<'PY'
+from pathlib import Path
+import sys
+active, disabled = (Path(p).read_bytes() for p in sys.argv[1:])
+for page in (active, disabled):
+    assert page.startswith(b"P5\n375 320\n255\n")
+    assert len(page) == 120015
+    assert page[15:].count(0) > 100
+changed = sum(a != b for a, b in zip(active[15:], disabled[15:]))
+assert changed > 200, f"CJK fallback ineffective: only {changed} changed pixels"
+print(f"MIPS Q2 Chinese/Japanese glyph fallback: PASS ({changed} pixel differences)")
+PY
+
 # The default must now use the extended multilingual Sans 12 pack, not just
 # the much smaller built-in UI glyph set.
 CROSSPOD_STATE_DIR="$card/.crosspod" timeout 90s qemu-mipsel -L "$root" "$elf" \
@@ -154,10 +214,12 @@ assert sans != serif, "Font choices must produce distinct glyph rasters"
 logs = [Path(p).read_text() for p in sys.argv[3:]]
 assert "CrossPod typeface: Sans 16pt" in logs[0], logs[0]
 assert "CrossPod typeface: Serif 18pt" in logs[1], logs[1]
-assert all("fallback" not in log for log in logs), logs
+assert all("Selected font file missing" not in log and "Font file not installed" not in log for log in logs), logs
 print("MIPS Q2 font switching and rendering: PASS")
 PY
 rm -f "$card/.crosspod/typography.conf"
+# Never ship QEMU-generated Section/page caches from the CI sample book.
+rm -rf -- "$card/.crosspod/cache"
 chmod +x "$card/.crosspod/q2-crosspod" "$card/.crosspod/crosspod-engine"
 (cd "$card" && zip -q -r "$base/dist/crosspod-q2-reader-alpha.zip" .crosspod Books)
 sha256sum "$base/dist/crosspod-q2-reader-alpha.zip" > "$base/dist/crosspod-q2-reader-alpha.zip.sha256"
